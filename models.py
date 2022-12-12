@@ -1,10 +1,10 @@
 import torch
 import gpytorch
-
+import math
 from typing import List
 
-from blitz.modules import BayesianLinear
-from blitz.utils import variational_estimator
+# from blitz.modules import BayesianLinear
+# from blitz.utils import variational_estimator
 
 
 class LSTMFeatureExtractor(torch.nn.Module):
@@ -82,34 +82,34 @@ class MLPFeatureExtractor(torch.nn.Module):
         return x
 
 
-@variational_estimator
-class BayesFeatureExtractor(torch.nn.Module):
-    def __init__(
-        self,
-        input_size: int,
-        hidden_size: List[int],
-        output_size: int,
-        num_layers: int = 1,
-    ):
-        super(BayesFeatureExtractor, self).__init__()
+# @variational_estimator
+# class BayesFeatureExtractor(torch.nn.Module):
+#     def __init__(
+#         self,
+#         input_size: int,
+#         hidden_size: List[int],
+#         output_size: int,
+#         num_layers: int = 1,
+#     ):
+#         super(BayesFeatureExtractor, self).__init__()
 
-        self.input_layer = torch.nn.ReLU(BayesianLinear(input_size, hidden_size[0]))
+#         self.input_layer = torch.nn.ReLU(BayesianLinear(input_size, hidden_size[0]))
 
-        self.blinears = torch.nn.ModuleList(
-            [
-                BayesianLinear(hidden_size[i], hidden_size[i + 1])
-                for i in range(num_layers)
-            ]
-        )
+#         self.blinears = torch.nn.ModuleList(
+#             [
+#                 BayesianLinear(hidden_size[i], hidden_size[i + 1])
+#                 for i in range(num_layers)
+#             ]
+#         )
 
-        self.output_layer = torch.nn.tanh(BayesianLinear(hidden_size[-1], output_size))
+#         self.output_layer = torch.nn.tanh(BayesianLinear(hidden_size[-1], output_size))
 
-    def forward(self, x):
-        x = self.input_layer(x)
-        for blinear in self.blinears:
-            x = torch.nn.ReLU(blinear(x))
-        x = self.output_layer(x)
-        return x
+#     def forward(self, x):
+#         x = self.input_layer(x)
+#         for blinear in self.blinears:
+#             x = torch.nn.ReLU(blinear(x))
+#         x = self.output_layer(x)
+#         return x
 
 
 class GaussianProcessLayer(gpytorch.models.ApproximateGP):

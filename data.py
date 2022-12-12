@@ -3,6 +3,10 @@ import pandas as pd
 import os
 import logging
 import torch
+import concurrent
+import json
+import re
+import tqdm
 
 from math import ceil
 from collections import defaultdict
@@ -10,6 +14,14 @@ from typing import List, Union
 
 logger = logging.getLogger(__name__)
 
+def flatten_dict(x: dict, prefix=""):
+    y = {}
+    for k, v in x.items():
+        if isinstance(v, dict):
+            y.update(flatten_dict(v, k + "_"))
+        else:
+            y[prefix + k] = v
+    return y
 
 def one_hot_encode(index, num_max, leave_one_out=True):
     res = np.array([int(i == index) for i in range(num_max)])
@@ -17,81 +29,64 @@ def one_hot_encode(index, num_max, leave_one_out=True):
         return res[1:]
     return res
 
+def num_of_lines(abs_path):
+    num = 0
+    if not os.path.exists(abs_path):
+        return num
+    with open(abs_path) as file:
+        for line in file:
+            num += 1
+    return num
+
+def read_dict(filepath):
+    tmp = []
+    with open(filepath) as f:
+        for line in f:
+            tmp.append(flatten_dict(json.loads(line)))
+    return tmp
+
 
 class GaussianPreprocessor(object):
     def __init__(
         self,
         data_paths,
-        masks=None,
-        normalized_features: Union[List[str], None] = None,
+        features: Union[List[str], None] = None,
+        normalize_features: Union[List[str], None] = None,
         onehot_features: Union[List[str], None] = None,
-        bounds=None,
-        filtermasks=None,
-        filtervalues=None,
+        lb: np.array = None,
+        ub: np.array = None,
     ):
         self.data_paths = data_paths
-        self.masks = masks
-        self.data_df = None
-        self.read_csv()
-        self.bounds = self.generate_bounds(bounds)
-        self.normalized_features = normalized_features
+        self.features = features
+        self.normalize_features = normalize_features
         self.onehot_features = onehot_features
-        self.data_df = None
-        self.filtermasks = filtermasks
-        self.filtervalues = filtervalues
+        self.lb = lb
+        self.ub = ub
 
-    def read_csv(self):
-        for p in self.data_paths:
-            for fn in os.listdir(p):
-                full_fn = os.path.join(p, fn)
-                if os.path.isfile(full_fn) and full_fn.endswith(".csv"):
-                    self.data_df = pd.concat(
-                        [self.data_df, pd.read_csv(full_fn)], axis=0, ignore_index=True
-                    )
+    def mask(self, x: pd.DataFrame, features=None):
+        if features is None:
+            return x    
+        return x[features]
 
-        self.data_df.reset_index()
-
-    def generate_bounds(self, bounds):
-        if bounds is not None:
-            return bounds
-
-        if self.data_df is None:
-            raise Exception("Not data frame specified yet")
-
-        return [self.data_df.min(), self.data_df.max()]
-
-    def features(self, x: pd.DataFrame):
-        selected_features = [
-            feature for feature in x.columns if feature not in self.masks
-        ]
-        return x[selected_features]
-
-    def normalize(self, x: pd.DataFrame):
-        if self.normalized_features is None:
+    def normalize(self, x: pd.DataFrame, features=None, lb=None, ub=None):
+        if features is None or lb is None or ub is None:
             return x
 
-        columns = self.normalized_features
-
-        lb = self.bounds[0]
-        ub = self.bounds[1]
-
-        x[columns] = x[columns].apply(
-            lambda x: (x[columns] - lb[columns]).div(ub[columns] - lb[columns]) * 2.0
-            - 1.0,
-            axis=1,
-        )
-
+        x[features] = (x[features] - lb) / (ub - lb) * 2.0 - 1.0
         return x
 
-    def onehot(self, x: pd.DataFrame):
-        if self.onehot_features is None:
+    def onehot(self, x: pd.DataFrame, features=None, lb=None, ub=None):
+        if features is None or lb is None or ub is None:
             return x
 
         oh_df = pd.DataFrame()
 
-        for col in self.onehot_features:
+        for i, col in enumerate(features):
 
-            num_max = int(self.bounds[1][col])
+            if col not in x.columns.tolist():
+                continue
+
+            num_max = ub[i] - lb[i]
 
             old_columns = oh_df.columns.tolist()
 
@@ -99,7 +94,7 @@ class GaussianPreprocessor(object):
                 [
                     oh_df,
                     x[col].apply(
-                        lambda r: pd.Series(one_hot_encode(int(r), num_max + 1, False))
+                        lambda r: pd.Series(one_hot_encode(int(r - lb[i]), num_max + 1, False))
                     ),
                 ],
                 axis=1,
@@ -109,33 +104,28 @@ class GaussianPreprocessor(object):
                 axis="columns",
             )
         x.pop(col)
-        x = pd.concat([x, oh_df], axis=1)
-        return x
+        return pd.concat([x, oh_df], axis=1)
 
     def prepare_df(self, x: pd.DataFrame):
-        x = self.features(x)
-        x = self.normalize(x)
-        x = self.onehot(x)
-        print(x.columns)
+        x["throttle"] -= x.pop("brake")
+        x = self.normalize(x, self.normalize_features, self.lb, self.ub)
+        x = self.onehot(x, self.onehot_features, self.lb, self.ub)
         return x
 
-    def preprocess_df_sequence(self, seq):
-        return torch.tensor([seq.to_numpy()])
+    def preprocess_df_sequence(self, seq_d):
+        tmp = []
+        for key, val in seq_d.items():
+            tmp.append(self.mask(val, self.features[key]))
+        df = pd.concat(tmp, axis=1)
+        return torch.tensor([self.prepare_df(df).to_numpy()])
 
     def filter(
         self,
         seq: pd.DataFrame,
     ):
-        masks = self.filtermasks
-        maskout = self.filtervalues
-
-        if masks is None or maskout is None:
-            return True
-
         for _, row in seq.iterrows():
-            for mask, out in zip(masks, maskout):
-                if row[mask] in out:
-                    return False
+            if row["drivingMode"] != "COMPLETE_AUTO_DRIVE":
+                return False
         return True
 
 
@@ -144,21 +134,25 @@ class BasicDataset(object):
         self,
         data_paths,
         batch_size,
-        preprocesser,
+        preprocessor,
+        files,
         augmentations=None,
-        include_ids=None,
+        include_dirs=None,
         shuffle=True,
         prepare_on_load=True,
+        args=None
     ):
         self.debug = False
         self.data_paths = data_paths
         self.batch_size = batch_size
-        self.preprocessor = preprocesser
+        self.preprocessor = preprocessor
+        self.files = files
         self.augmentations = augmentations
         self.shuffle = shuffle
         self.prepare_on_load = prepare_on_load
-        self.data_d = {}
-        self.load_data(include_ids)
+        self.data_d = defaultdict(dict)
+        self.args = args
+        self.load_data(include_dirs, args)
 
     @property
     def size(self) -> int:
@@ -168,23 +162,38 @@ class BasicDataset(object):
     def batches_per_epoch(self) -> int:
         return ceil(self.size / self.batch_size)
 
-    def load_data(self, include_ids=None):
-        if include_ids is not None:
-            include_ids = set(include_ids)
+    def load_data(self, include_dirs=None):
+        if include_dirs is not None:
+            include_dirs = set(include_dirs)
 
-        for p in self.data_paths:
-            for fn in os.listdir(p):
-                if include_ids is not None and fn not in include_ids:
+
+        for path in self.data_paths:
+            for case in os.listdir(path):
+                if include_dirs is not None and case not in include_dirs:
                     continue
-                full_fn = os.path.join(p, fn)
 
-                if full_fn in self.data_d:
-                    logger.warning(f"Duplicate file name {fn}")
-                self.data_d[full_fn] = (
-                    self.preprocessor.prepare_df(pd.read_csv(full_fn))
-                    if self.prepare_on_load
-                    else pd.read_csv(full_fn)
-                )
+                incompleted_files = False
+                file_length = None
+                tmp = defaultdict(pd.DataFrame) if self.in_memory else defaultdict(str)
+                for f in self.files:
+                    filepath = os.path.join(path, case, f)
+                    if file_length is not None and file_length != num_of_lines(filepath):
+                        incompleted_files = True
+                        break
+                    file_length = num_of_lines(filepath)
+
+                    if self.args.in_memory:
+                        tmp[f] = pd.DataFrame(read_dict(filepath))
+                    else:
+                        df = pd.DataFrame(read_dict(filepath))
+                        filename_in_csv = re.sub(".txt$", ".csv", filepath)
+                        df.to_csv(filename_in_csv)
+                        tmp[f] = filename_in_csv
+
+                if incompleted_files:
+                    continue
+                
+                self.data_d[case] = tmp
 
     def batches(self):
         raise NotImplementedError()
@@ -196,22 +205,26 @@ class SequenceDataset(BasicDataset):
         data_paths,
         batch_size,
         preprocessor,
+        files,
         augmentations=None,
-        include_ids=None,
+        include_dirs=None,
         shuffle=True,
         prepare_on_load=True,
         num_actions=0,
         seq_length=10,
         leave_one_out_encoding=True,
+        args=None,
     ):
         super().__init__(
             data_paths,
             batch_size,
             preprocessor,
+            files,
             augmentations,
-            include_ids,
+            include_dirs,
             shuffle,
             prepare_on_load,
+            args
         )
         if seq_length < 2:
             raise ValueError("Need sequence length of at least 2")
@@ -220,15 +233,16 @@ class SequenceDataset(BasicDataset):
         self.seq_length = seq_length
         self.leave_one_out = leave_one_out_encoding
         self.sequences = []
-        self.generate_sequences()
+        self.generate_sequences(args)
 
-    def generate_sequences(self):
+    def generate_sequences(self, args):
         self.sequences = defaultdict(list)
 
-        for seq_id, df in self.data_d.items():
-            print(seq_id, df)
+        for seq_id, df_dict in self.data_d.items():
 
-            if df.shape[0] < self.seq_length:
+            df = df_dict[self.files[0]] if args.in_memory else pd.read_csv(df_dict[self.files[0]])
+            num_samples = df.shape[0]
+            if num_samples < self.seq_length:
                 logger.warning(
                     f"Sequence {seq_id} is too short for sequence length {self.seq_length}"
                 )
@@ -236,7 +250,7 @@ class SequenceDataset(BasicDataset):
 
             index = df.index.tolist()
             lst_idx = 0
-            while lst_idx + self.seq_length <= df.shape[0]:
+            while lst_idx + self.seq_length <= num_samples:
                 seq = index[lst_idx : lst_idx + self.seq_length]
                 if self.preprocessor.filter(
                     df.iloc[index[lst_idx : lst_idx + self.seq_length]]
@@ -248,30 +262,69 @@ class SequenceDataset(BasicDataset):
             f"Generated {len(self.sequences)} sequences of length {self.seq_length}"
         )
 
-    def load_data(self, include_ids=None):
-        self.data_d = defaultdict(pd.DataFrame)
-        if isinstance(include_ids, dict) and {
-            type(v) for v in include_ids.values()
-        } == {list}:
-            for p in self.data_paths:
-                print(self.data_paths)
-                for seq_id, lst in include_ids.items():
-                    print(seq_id, lst)
-                    for obj in lst:
-                        fn = obj["fn"]
-                        full_fn = os.path.join(p, fn)
-                        if not os.path.exists(full_fn):
+    def load_data(self, include_dirs, args):
+
+        self.data_d = defaultdict(list)
+
+        if not args.in_memory:
+            tasks = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+                for path in self.data_paths:
+                    for case in os.listdir(path):
+                        if include_dirs is not None and case not in include_dirs:
                             continue
-
-                        df = (
-                            self.preprocessor.prepare_df(pd.read_csv(full_fn))
-                            if self.prepare_on_load
-                            else pd.read_csv(full_fn)
-                        )
-                        self.data_d[seq_id] = df
+                        tasks.append(executor.submit(self._load_data, path, case))
+                for future in tqdm.tqdm(concurrent.futures.as_completed(tasks), total=len(tasks)):
+                    try:
+                        case, dictionary = future.result()
+                        if dictionary is not None:
+                            self.data_d[case] = dictionary
+                    except Exception as e:
+                        logger.error(e)
         else:
-            raise NotImplementedError()
+            for path in self.data_paths:
+                for case in os.listdir(path):
+                    if include_dirs is not None and case not in include_dirs:
+                        continue
 
+                    incompleted_files = False
+                    file_length = None
+                    tmp = defaultdict(pd.DataFrame)
+                    for f in self.files:
+                        filepath = os.path.join(path, case, f)
+                        if file_length is not None and file_length != num_of_lines(filepath):
+                            incompleted_files = True
+                            break
+                        file_length = num_of_lines(filepath)
+                        tmp[f] = pd.DataFrame(read_dict(filepath))
+
+                    if incompleted_files:
+                            continue
+                        
+                    self.data_d[case] = tmp
+
+    def _load_data(self, path, case):
+        incompleted_files = False
+        file_length = None
+        tmp = defaultdict(str)
+        for f in self.files:
+            filepath = os.path.join(path, case, f)
+            filename_in_csv = re.sub(".txt$", ".csv", filepath)
+
+            if file_length is not None and file_length != num_of_lines(filepath):
+                incompleted_files = True
+                break
+            file_length = num_of_lines(filepath)
+
+            df =  pd.DataFrame(read_dict(filepath))
+            df.to_csv(filename_in_csv)
+
+            tmp[f] = filename_in_csv
+
+        if incompleted_files:
+            return case, None
+        return case, tmp
+                    
     def actions_to_tensor(self, seq):
         raise NotImplementedError()
 
@@ -285,47 +338,55 @@ class SequenceReconstructionDataset(SequenceDataset):
         data_paths,
         batch_size,
         preprocessor,
+        files,
         augmentations=None,
-        include_ids=None,
+        include_dirs=None,
         shuffle=True,
         prepare_on_load=True,
         num_actions=0,
         seq_length=10,
         leave_one_out_encoding=True,
+        args=None
     ):
         super().__init__(
             data_paths,
             batch_size,
             preprocessor,
+            files,
             augmentations,
-            include_ids,
+            include_dirs,
             shuffle,
             prepare_on_load,
             num_actions,
             seq_length,
             leave_one_out_encoding,
+            args
         )
 
     def batches(self):
         data = self.sequences
 
-        if self.shuffle:
-            for key, lst in self.sequences.items():
-                data[key] = [lst[i] for i in np.random.permutation(len(lst))]
+        # if self.shuffle:
+        #     for key, lst in self.sequences.items():
+        #         data[key] = [lst[i] for i in np.random.permutation(len(lst))]
 
-        for key, lst in data.items():
+        keys = [list(self.sequences.keys())[i] for i in np.random.permutation(len(self.sequences.keys()))]
 
+        for key in keys:
+            lst = [data[key][i] for i in np.random.permutation(len(data[key]))]
             curr_idx = 0
-
             while curr_idx < len(lst):
                 x_batch_list = []
 
                 while curr_idx < len(lst) and len(x_batch_list) < 100:
-                    seq_df = self.data_d[key].iloc[lst[curr_idx]]
+                    seq_df_d = {}
+                    for file in self.files:
+                        seq_df_d[file] = self.data_d[key][file].iloc[lst[curr_idx]] if self.args.in_memory \
+                            else pd.read_csv(self.data_d[key][file]).iloc[lst[curr_idx]]
+                    x_tensor = self.preprocessor.preprocess_df_sequence(seq_df_d)
 
-                    x_tensor = self.preprocessor.preprocess_df_sequence(seq_df)
-
-                    x_batch_list.append(x_tensor)
+                    if x_tensor is not None:
+                        x_batch_list.append(x_tensor)
 
                     curr_idx += 1
 
@@ -334,20 +395,18 @@ class SequenceReconstructionDataset(SequenceDataset):
                 yield x_batch
 
     def sample(self):
-
         data = self.sequences
 
-        for key, lst in self.sequences.items():
-            data[key] = [lst[i] for i in np.random.permutation(len(lst))]
+        keys = [list(self.sequences.keys())[i] for i in np.random.permutation(len(self.sequences.keys()))]
+        lst = [data[keys[0]][i] for i in np.random.permutation(len(data[keys[0]]))]
 
-        keys = list(data.keys())
-        key = keys[np.random.randint(len(data.keys()))]
-
-        lst = data[key]
-
-        seq_df = self.data_d[key].iloc[lst[0]]
-
-        return self.preprocessor.preprocess_df_sequence(seq_df)
+        key = keys[0]
+        seq_df_d = {}
+        for file in self.files:
+            seq_df_d[file] = self.data_d[key][file].iloc[lst[0]] if self.args.in_memory \
+                else pd.read_csv(self.data_d[key][file]).iloc[lst[0]]
+     
+        return self.preprocessor.preprocess_df_sequence(seq_df_d)
 
 
 class SequencePredictionDataset(SequenceDataset):
@@ -356,26 +415,30 @@ class SequencePredictionDataset(SequenceDataset):
         data_paths,
         batch_size,
         preprocessor,
+        file,
         augmentations=None,
-        include_ids=None,
+        include_dirs=None,
         shuffle=True,
         prepare_on_load=True,
         num_actions=0,
         seq_length=10,
         forecast_length=5,
         leave_one_out_encoding=True,
+        args=None
     ):
         super().__init__(
             data_paths,
             batch_size,
             preprocessor,
+            file,
             augmentations,
-            include_ids,
+            include_dirs,
             shuffle,
             prepare_on_load,
             num_actions,
             seq_length,
             leave_one_out_encoding,
+            args
         )
         if forecast_length >= seq_length:
             raise Exception("forecasting sequence is too long")
@@ -386,7 +449,7 @@ class SequencePredictionDataset(SequenceDataset):
 
         if self.shuffle:
             for key, lst in self.sequences.items():
-                print("key {}".format(key))
+                # print("key {}".format(key))
                 data[key] = [lst[i] for i in np.random.permutation(len(lst))]
 
         for key, lst in data.items():
