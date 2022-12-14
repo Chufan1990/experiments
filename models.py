@@ -12,7 +12,7 @@ class LSTMFeatureExtractor(torch.nn.Module):
         self,
         input_size: int,
         hidden_size: int,
-        output_size: int,
+        output_size: int = 0,
         num_layers: int = 2,
         bidirectional: bool = True,
         dropout: float = 0.0,
@@ -25,17 +25,18 @@ class LSTMFeatureExtractor(torch.nn.Module):
         self.bidirectional = bidirectional
         self.dropout = dropout
 
-        self.rnn = torch.nn.LSTM(
+        self.encoder = torch.nn.LSTM(
             input_size,
             hidden_size,
             num_layers,
-            proj_size=self.output_size,
+            proj_size=output_size,
             dropout=dropout,
             bidirectional=bidirectional,
         )
 
     def forward(self, x: torch.Tensor):
-        return self.rnn(x)
+        output, self.hidden_state = self.encoder(x)
+        return output
 
 
 class MLPFeatureExtractor(torch.nn.Module):
@@ -148,3 +149,17 @@ class GaussianProcessLayer(gpytorch.models.ApproximateGP):
         mean = self.mean_module(x)
         covar = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean, covar)
+
+
+class GPModel(gpytorch.models.ApproximateGP):
+    def __init__(self, inducing_points):
+        variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(inducing_points.size(0))
+        variational_strategy = gpytorch.variational.VariationalStrategy(self, inducing_points, variational_distribution, learn_inducing_locations=True)
+        super(GPModel, self).__init__(variational_strategy)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
